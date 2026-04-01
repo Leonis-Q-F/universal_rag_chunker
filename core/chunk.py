@@ -1,22 +1,16 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 from uuid import uuid4
 
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field, PrivateAttr
 
-from universal_rag_chunker.models.schemes import ParentChunk, SourceDocument
-
-try:
-    from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-except ImportError:  # pragma: no cover - 兼容旧版 LangChain 安装方式
-    try:
-        from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-    except ImportError:  # pragma: no cover - 运行时依赖保护
-        MarkdownHeaderTextSplitter = None
-        RecursiveCharacterTextSplitter = None
+from models.schemes import ChildBlock, ParentChunk, SourceDocument
+from utils.embeddings import build_embedding_model
 
 try:
     import tiktoken
@@ -26,33 +20,59 @@ except ImportError:  # pragma: no cover - 可选依赖
 
 @dataclass(slots=True)
 class SplitSection:
+    """表示一级切分后的中间结果。"""
+
     content: str
-    metadata: dict[str, Any]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class ChunkingResult(BaseModel):
+    """表示父块与子块的完整切分结果。"""
+
+    parent_chunks: list[ParentChunk] = Field(default_factory=list, description="一级切分生成的父块列表。")
+    child_blocks: list[ChildBlock] = Field(default_factory=list, description="二级切分生成的子块列表。")
 
 
 class StructuralSplitConfig(BaseModel):
-    """一级父块切分配置。"""
+    """控制结构切分、语义切分和长度兜底的配置。"""
 
-    max_tokens: int = Field(default=1200, ge=50, description="每个父块的目标长度上限。")
-    chunk_overlap: int = Field(default=100, ge=0, description="仅在超长分段再次切分时使用的重叠长度。")
-    tokenizer_encoding: str = Field(default="cl100k_base", description="tiktoken 使用的编码名称。")
-    strip_headers: bool = Field(default=False, description="按标题切分时，是否从正文中移除 Markdown 标题行。")
-    headers_to_split_on: tuple[tuple[str, str], ...] = Field(
-        default=(("#", "一级标题"), ("##", "二级标题"), ("###", "三级标题")),
-        description="一级结构切分时使用的 Markdown 标题层级。",
+    parent_max_tokens: int = Field(default=1200, ge=100, description="父块的目标最大长度。")
+    parent_min_tokens: int = Field(default=240, ge=1, description="父块的目标最小长度。")
+    parent_chunk_overlap: int = Field(default=120, ge=0, description="父块长度兜底切分时的重叠长度。")
+    child_max_tokens: int = Field(default=320, ge=50, description="子块的目标最大长度。")
+    child_chunk_overlap: int = Field(default=50, ge=0, description="子块切分时的重叠长度。")
+    semantic_buffer_size: int = Field(default=1, ge=1, description="语义切分时向前向后缓冲的句子数量。")
+    semantic_breakpoint_threshold_type: Literal[
+        "percentile",
+        "standard_deviation",
+        "interquartile",
+        "gradient",
+    ] = Field(default="percentile", description="语义切分断点阈值的计算方式。")
+    semantic_breakpoint_threshold_amount: float | None = Field(
+        default=None,
+        description="语义切分断点阈值的具体数值，不配置时使用库默认策略。",
     )
+    semantic_sentence_split_regex: str = Field(
+        default=r"(?<=[。！？.!?])\s+|\n+",
+        description="语义切分前用于识别句子边界的正则表达式。",
+    )
+    tokenizer_encoding: str = Field(default="cl100k_base", description="tiktoken 使用的编码名称。")
 
     def model_post_init(self, __context: Any) -> None:
-        """校验配置是否合法，避免重叠长度大于等于目标长度。"""
-        if self.chunk_overlap >= self.max_tokens:
-            raise ValueError("chunk_overlap 必须小于 max_tokens")
+        """校验长度参数，避免出现无效配置。"""
+        if self.parent_min_tokens >= self.parent_max_tokens:
+            raise ValueError("父块最小长度必须小于父块最大长度。")
+        if self.parent_chunk_overlap >= self.parent_max_tokens:
+            raise ValueError("父块重叠长度必须小于父块最大长度。")
+        if self.child_chunk_overlap >= self.child_max_tokens:
+            raise ValueError("子块重叠长度必须小于子块最大长度。")
 
 
 class TokenCounter:
-    """用于长度判断和 metadata 记录的轻量计数器。"""
+    """负责估算文本长度，优先返回真实 token 数。"""
 
     def __init__(self, encoding_name: str = "cl100k_base") -> None:
-        """初始化计数器，优先使用 tiktoken 进行真实长度统计。"""
+        """初始化计数器，优先加载 tiktoken 编码器。"""
         self._encoding = None
         if tiktoken is not None:
             try:
@@ -61,7 +81,7 @@ class TokenCounter:
                 self._encoding = None
 
     def count(self, text: str) -> int:
-        """统计文本长度，优先返回 token 数，缺少依赖时退化为近似值。"""
+        """统计文本长度。"""
         text = text.strip()
         if not text:
             return 0
@@ -73,154 +93,262 @@ class TokenCounter:
 
 
 class MarkdownStructureSplitter(BaseModel):
-    """基于 LangChain 文本切分能力的一级结构切分器。"""
+    """先做路由，再做一级父块和二级子块切分。"""
 
     config: StructuralSplitConfig = Field(default_factory=StructuralSplitConfig)
 
     _token_counter: TokenCounter = PrivateAttr()
-    _header_splitter: Any = PrivateAttr()
-    _length_splitter: Any = PrivateAttr()
+    _header_splitter: MarkdownHeaderTextSplitter = PrivateAttr()
+    _parent_splitter: RecursiveCharacterTextSplitter = PrivateAttr()
+    _child_splitter: RecursiveCharacterTextSplitter = PrivateAttr()
+    _semantic_splitter: SemanticChunker | None = PrivateAttr(default=None)
+    _embedding_model: Any = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
-        """初始化一级切分所需的标题切分器、长度切分器和计数器。"""
-        if MarkdownHeaderTextSplitter is None or RecursiveCharacterTextSplitter is None:
-            raise ImportError(
-                "缺少 LangChain 文本切分依赖，请安装 `langchain-text-splitters` "
-                "或兼容版本的 `langchain`。"
-            )
-
+        """初始化结构切分器和长度兜底切分器。"""
         self._token_counter = TokenCounter(self.config.tokenizer_encoding)
-        self._header_splitter = MarkdownHeaderTextSplitter(
-            headers_to_split_on=list(self.config.headers_to_split_on),
-            strip_headers=self.config.strip_headers,
+        self._header_splitter = self._build_header_splitter()
+        self._parent_splitter = self._build_length_splitter(
+            chunk_size=self.config.parent_max_tokens,
+            chunk_overlap=self.config.parent_chunk_overlap,
         )
-        self._length_splitter = self._build_length_splitter()
+        self._child_splitter = self._build_length_splitter(
+            chunk_size=self.config.child_max_tokens,
+            chunk_overlap=self.config.child_chunk_overlap,
+        )
 
-    def split_document(self, doc: SourceDocument) -> list[ParentChunk]:
-        """对 SourceDocument 执行一级切分，并输出 ParentChunk 列表。"""
+    def split_document(self, doc: SourceDocument) -> ChunkingResult:
+        """对单个文档执行父子分层切分。"""
         sections = self.split_markdown(doc.parsed_md_content)
-        return self._to_parent_chunks(doc, sections)
+        parent_chunks = self._to_parent_chunks(doc, sections)
+        child_blocks = self._to_child_blocks(parent_chunks)
+        return ChunkingResult(parent_chunks=parent_chunks, child_blocks=child_blocks)
 
     def split_markdown(self, markdown: str) -> list[SplitSection]:
-        """对 Markdown 文本执行一级切分，返回内部使用的分段结果。"""
-        sections = self._split_by_headers(markdown)
-        return self._split_oversized_sections(sections)
-
-    def _split_by_headers(self, markdown: str) -> list[SplitSection]:
-        """先按 Markdown 标题切分文本，得到结构化的初始分段。"""
-        markdown = markdown.strip()
+        """对 Markdown 文本执行一级切分，并自动选择切分路由。"""
+        markdown = self._sanitize_text(markdown, keep_newlines=True)
         if not markdown:
             return []
 
+        if self._has_markdown_headings(markdown):
+            return self._split_by_headers(markdown)
+        return self._split_by_semantic(markdown)
+
+    def _has_markdown_headings(self, markdown: str) -> bool:
+        """判断输入文本是否包含明确的 Markdown 标题。"""
+        return bool(re.search(r"(?m)^\s{0,3}#{1,6}\s+\S", markdown))
+
+    def _split_by_headers(self, markdown: str) -> list[SplitSection]:
+        """当存在明确标题时，优先按标题结构切分。"""
         documents = self._header_splitter.split_text(markdown)
-        if not documents:
-            return [SplitSection(content=markdown, metadata={})]
+        sections: list[SplitSection] = []
 
-        sections = [
-            SplitSection(content=document.page_content.strip(), metadata=dict(document.metadata or {}))
-            for document in documents
-            if document.page_content.strip()
+        for document in documents:
+            content = self._sanitize_text(document.page_content, keep_newlines=True)
+            if not content:
+                continue
+
+            header_path = self._extract_header_path(document.metadata)
+            metadata = {
+                "header_path": header_path,
+                "heading_level": len(header_path) or None,
+                "split_route": "标题结构切分",
+            }
+            sections.extend(self._split_section_content(content, metadata))
+
+        return sections
+
+    def _split_by_semantic(self, markdown: str) -> list[SplitSection]:
+        """当不存在明确标题时，退回到 embedding 语义切分。"""
+        text = self._normalize_plain_text(markdown)
+        if not text:
+            return []
+
+        pieces = [
+            self._sanitize_text(piece, keep_newlines=True)
+            for piece in self._get_semantic_splitter().split_text(text)
+            if self._sanitize_text(piece, keep_newlines=True)
         ]
-        return sections or [SplitSection(content=markdown, metadata={})]
 
-    def _split_oversized_sections(self, sections: list[SplitSection]) -> list[SplitSection]:
-        """对超长分段做长度兜底切分，并在需要时补回标题前缀。"""
-        expanded: list[SplitSection] = []
+        sections: list[SplitSection] = []
+        metadata = {"header_path": [], "heading_level": None, "split_route": "语义切分"}
+        for content in pieces:
+            sections.extend(self._split_section_content(content, metadata))
+        return sections
 
-        for section in sections:
-            if self._token_counter.count(section.content) <= self.config.max_tokens:
-                expanded.append(section)
-                continue
+    def _split_section_content(self, content: str, metadata: dict[str, Any]) -> list[SplitSection]:
+        """对单个一级块应用长度兜底切分。"""
+        content = self._sanitize_text(content, keep_newlines=True)
+        if not content:
+            return []
 
-            chunks = [chunk.strip() for chunk in self._length_splitter.split_text(section.content) if chunk.strip()]
-            if len(chunks) <= 1:
-                expanded.append(section)
-                continue
+        if self._token_counter.count(content) <= self.config.parent_max_tokens:
+            return [SplitSection(content=content, metadata=dict(metadata))]
 
-            header_prefix = self._render_header_prefix(section.metadata)
-            total = len(chunks)
+        pieces = self._split_by_length(content, self._parent_splitter)
+        if len(pieces) <= 1:
+            return [SplitSection(content=content, metadata=dict(metadata))]
 
-            for index, chunk in enumerate(chunks):
-                content = chunk
-                if header_prefix and (index > 0 or self.config.strip_headers):
-                    content = f"{header_prefix}\n\n{chunk}"
-
-                metadata = {
-                    **section.metadata,
-                    "split_part": index,
-                    "split_total": total,
-                }
-                expanded.append(SplitSection(content=content, metadata=metadata))
-
-        return expanded
-
-    def _to_parent_chunks(
-        self,
-        doc: SourceDocument,
-        sections: list[SplitSection],
-    ) -> list[ParentChunk]:
-        """把内部切分结果转换成统一的 ParentChunk 数据结构。"""
-        return [
-            ParentChunk(
-                parent_id=uuid4(),
-                doc_id=doc.doc_id,
-                content=section.content,
-                metadata={
-                    "file_name": doc.file_name,
-                    "file_type": doc.file_type.value,
-                    "header_path": self._header_path(section.metadata),
-                    "heading_level": self._heading_level(section.metadata),
-                    "token_count": self._token_counter.count(section.content),
-                    **section.metadata,
-                },
-                chunk_index=index,
+        sections: list[SplitSection] = []
+        total = len(pieces)
+        for index, piece in enumerate(pieces):
+            sections.append(
+                SplitSection(
+                    content=piece,
+                    metadata={**metadata, "split_part": index, "split_total": total},
+                )
             )
-            for index, section in enumerate(sections)
-        ]
+        return sections
 
-    def _build_length_splitter(self) -> Any:
-        """构建按长度兜底切分的工具，优先使用基于 tiktoken 的实现。"""
-        separators = ["\n\n", "\n", "。", "！", "？", ".", "；", ";", "，", ",", " ", ""]
+    def _to_parent_chunks(self, doc: SourceDocument, sections: list[SplitSection]) -> list[ParentChunk]:
+        """把一级切分结果转换成 ParentChunk 模型。"""
+        parent_chunks: list[ParentChunk] = []
+
+        for index, section in enumerate(sections):
+            content = self._sanitize_text(section.content, keep_newlines=True)
+            if not content:
+                continue
+
+            parent_chunks.append(
+                ParentChunk(
+                    parent_id=uuid4(),
+                    doc_id=doc.doc_id,
+                    content=content,
+                    metadata={
+                        "file_name": doc.file_name,
+                        "file_type": doc.file_type.value,
+                        "token_count": self._token_counter.count(content),
+                        **section.metadata,
+                    },
+                    chunk_index=index,
+                )
+            )
+
+        return parent_chunks
+
+    def _to_child_blocks(self, parent_chunks: list[ParentChunk]) -> list[ChildBlock]:
+        """把父块继续切成用于向量检索的子块。"""
+        child_blocks: list[ChildBlock] = []
+
+        for parent in parent_chunks:
+            pieces = self._split_by_length(parent.content, self._child_splitter)
+            if not pieces:
+                pieces = [parent.content]
+
+            total = len(pieces)
+            for index, piece in enumerate(pieces):
+                child_blocks.append(
+                    ChildBlock(
+                        block_id=uuid4(),
+                        parent_id=parent.parent_id,
+                        content=piece,
+                        embedding=[],
+                        metadata={
+                            **parent.metadata,
+                            "child_index": index,
+                            "child_total": total,
+                            "child_token_count": self._token_counter.count(piece),
+                            "embedding_ready": False,
+                        },
+                    )
+                )
+
+        return child_blocks
+
+    def _build_header_splitter(self) -> MarkdownHeaderTextSplitter:
+        """构造按 Markdown 标题切分的结构切分器。"""
+        return MarkdownHeaderTextSplitter(
+            headers_to_split_on=[
+                ("#", "一级标题"),
+                ("##", "二级标题"),
+                ("###", "三级标题"),
+            ],
+            strip_headers=False,
+        )
+
+    def _get_semantic_splitter(self) -> SemanticChunker:
+        """按需初始化并返回语义切分器。"""
+        if self._semantic_splitter is None:
+            self._semantic_splitter = self._build_semantic_splitter()
+        return self._semantic_splitter
+
+    def _build_semantic_splitter(self) -> SemanticChunker:
+        """构造基于 embedding 的语义切分器。"""
+        return SemanticChunker(
+            embeddings=self._get_embedding_model(),
+            buffer_size=self.config.semantic_buffer_size,
+            breakpoint_threshold_type=self.config.semantic_breakpoint_threshold_type,
+            breakpoint_threshold_amount=self.config.semantic_breakpoint_threshold_amount,
+            sentence_split_regex=self.config.semantic_sentence_split_regex,
+        )
+
+    def _get_embedding_model(self) -> Any:
+        """按需初始化并返回 embedding 模型。"""
+        if self._embedding_model is None:
+            self._embedding_model = build_embedding_model()
+        return self._embedding_model
+
+    def _build_length_splitter(self, chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
+        """构造统一的长度兜底切分器。"""
+        separators = ["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", "；", ";", "，", ",", " ", ""]
 
         try:
             return RecursiveCharacterTextSplitter.from_tiktoken_encoder(
                 encoding_name=self.config.tokenizer_encoding,
-                chunk_size=self.config.max_tokens,
-                chunk_overlap=self.config.chunk_overlap,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
                 separators=separators,
             )
         except Exception:
             return RecursiveCharacterTextSplitter(
-                chunk_size=self.config.max_tokens,
-                chunk_overlap=self.config.chunk_overlap,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
                 separators=separators,
             )
 
-    def _header_path(self, metadata: dict[str, Any]) -> list[str]:
-        """从标题元数据中提取层级路径。"""
-        path: list[str] = []
-        for _, key in self.config.headers_to_split_on:
-            value = metadata.get(key)
-            if value:
-                path.append(str(value))
-        return path
+    def _extract_header_path(self, metadata: dict[str, Any]) -> list[str]:
+        """从标题切分器的 metadata 中提取标题路径。"""
+        header_path = [
+            metadata.get("一级标题"),
+            metadata.get("二级标题"),
+            metadata.get("三级标题"),
+        ]
+        return [item for item in header_path if item]
 
-    def _heading_level(self, metadata: dict[str, Any]) -> int | None:
-        """根据标题路径长度推导当前分段的标题层级。"""
-        level = len(self._header_path(metadata))
-        return level or None
+    def _split_by_length(self, text: str, splitter: RecursiveCharacterTextSplitter) -> list[str]:
+        """使用统一长度切分器切分文本。"""
+        return [
+            self._sanitize_text(piece, keep_newlines=True)
+            for piece in splitter.split_text(text)
+            if self._sanitize_text(piece, keep_newlines=True)
+        ]
 
-    def _render_header_prefix(self, metadata: dict[str, Any]) -> str:
-        """把标题元数据重新渲染成 Markdown 标题前缀，用于补回上下文。"""
-        lines: list[str] = []
-        for header_mark, key in self.config.headers_to_split_on:
-            value = metadata.get(key)
-            if value:
-                lines.append(f"{header_mark} {value}")
-        return "\n".join(lines).strip()
+    def _sanitize_text(self, text: str, keep_newlines: bool) -> str:
+        """清理非法字符，并按需要保留换行。"""
+        if not text:
+            return ""
+
+        text = re.sub(r"[\ud800-\udfff]", "", text)
+        text = text.replace("\u00ad", "")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"([A-Za-z])-\n([A-Za-z])", r"\1\2", text)
+        if keep_newlines:
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            return text.strip()
+
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _normalize_plain_text(self, text: str) -> str:
+        """把 Markdown 或纯文本规范化为适合语义切分的连续文本。"""
+        text = self._sanitize_text(text, keep_newlines=False)
+        text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+        return text.strip()
 
 
 __all__ = [
+    "ChunkingResult",
     "MarkdownStructureSplitter",
     "SplitSection",
     "StructuralSplitConfig",
