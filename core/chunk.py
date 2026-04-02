@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import uuid4
 
+import tiktoken
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field, PrivateAttr
@@ -12,10 +13,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 from models.schemes import ChildBlock, ParentChunk, SourceDocument
 from utils.embeddings import build_embedding_model
 
-try:
-    import tiktoken
-except ImportError:  # pragma: no cover - 可选依赖
-    tiktoken = None
+Language = Literal["zh", "en"]
 
 
 @dataclass(slots=True)
@@ -52,9 +50,18 @@ class StructuralSplitConfig(BaseModel):
         default=None,
         description="语义切分断点阈值的具体数值，不配置时使用库默认策略。",
     )
-    semantic_sentence_split_regex: str = Field(
-        default=r"(?<=[。！？.!?])\s+|\n+",
-        description="语义切分前用于识别句子边界的正则表达式。",
+    zh_semantic_sentence_split_regex: str = Field(
+        default=r"(?<=[。！？；])(?:\s+)?|\n+",
+        description="中文语义切分前用于识别句子边界的正则表达式。",
+    )
+    en_semantic_sentence_split_regex: str = Field(
+        default=r"(?<=[.!?;:])\s+|\n+",
+        description="英文语义切分前用于识别句子边界的正则表达式。",
+    )
+    language_detect_sample_size: int = Field(
+        default=4000,
+        ge=200,
+        description="自动识别语言时用于抽样判断的最大字符数。",
     )
     tokenizer_encoding: str = Field(default="cl100k_base", description="tiktoken 使用的编码名称。")
 
@@ -72,24 +79,15 @@ class TokenCounter:
     """负责估算文本长度，优先返回真实 token 数。"""
 
     def __init__(self, encoding_name: str = "cl100k_base") -> None:
-        """初始化计数器，优先加载 tiktoken 编码器。"""
-        self._encoding = None
-        if tiktoken is not None:
-            try:
-                self._encoding = tiktoken.get_encoding(encoding_name)
-            except Exception:
-                self._encoding = None
+        """初始化计数器并加载 tiktoken 编码器。"""
+        self._encoding = tiktoken.get_encoding(encoding_name)
 
     def count(self, text: str) -> int:
         """统计文本长度。"""
         text = text.strip()
         if not text:
             return 0
-
-        if self._encoding is not None:
-            return len(self._encoding.encode(text))
-
-        return len(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^\s]", text))
+        return len(self._encoding.encode(text))
 
 
 class MarkdownStructureSplitter(BaseModel):
@@ -99,23 +97,15 @@ class MarkdownStructureSplitter(BaseModel):
 
     _token_counter: TokenCounter = PrivateAttr()
     _header_splitter: MarkdownHeaderTextSplitter = PrivateAttr()
-    _parent_splitter: RecursiveCharacterTextSplitter = PrivateAttr()
-    _child_splitter: RecursiveCharacterTextSplitter = PrivateAttr()
-    _semantic_splitter: SemanticChunker | None = PrivateAttr(default=None)
+    _parent_splitters: dict[Language, RecursiveCharacterTextSplitter] = PrivateAttr(default_factory=dict)
+    _child_splitters: dict[Language, RecursiveCharacterTextSplitter] = PrivateAttr(default_factory=dict)
+    _semantic_splitters: dict[Language, SemanticChunker] = PrivateAttr(default_factory=dict)
     _embedding_model: Any = PrivateAttr(default=None)
 
     def model_post_init(self, __context: Any) -> None:
-        """初始化结构切分器和长度兜底切分器。"""
+        """初始化结构切分器和长度计数器。"""
         self._token_counter = TokenCounter(self.config.tokenizer_encoding)
         self._header_splitter = self._build_header_splitter()
-        self._parent_splitter = self._build_length_splitter(
-            chunk_size=self.config.parent_max_tokens,
-            chunk_overlap=self.config.parent_chunk_overlap,
-        )
-        self._child_splitter = self._build_length_splitter(
-            chunk_size=self.config.child_max_tokens,
-            chunk_overlap=self.config.child_chunk_overlap,
-        )
 
     def split_document(self, doc: SourceDocument) -> ChunkingResult:
         """对单个文档执行父子分层切分。"""
@@ -130,15 +120,29 @@ class MarkdownStructureSplitter(BaseModel):
         if not markdown:
             return []
 
+        language = self._detect_language(markdown)
         if self._has_markdown_headings(markdown):
-            return self._split_by_headers(markdown)
-        return self._split_by_semantic(markdown)
+            sections = self._split_by_headers(markdown, language)
+            if sections:
+                return sections
+
+        return self._split_by_semantic(markdown, language)
 
     def _has_markdown_headings(self, markdown: str) -> bool:
         """判断输入文本是否包含明确的 Markdown 标题。"""
         return bool(re.search(r"(?m)^\s{0,3}#{1,6}\s+\S", markdown))
 
-    def _split_by_headers(self, markdown: str) -> list[SplitSection]:
+    def _detect_language(self, text: str) -> Language:
+        """自动识别文本主语言，目前只区分中文和英文。"""
+        sample = self._normalize_plain_text(text)[: self.config.language_detect_sample_size]
+        if not sample:
+            return "en"
+
+        cjk_count = len(re.findall(r"[\u4e00-\u9fff]", sample))
+        latin_word_count = len(re.findall(r"[A-Za-z]+", sample))
+        return "zh" if cjk_count >= latin_word_count else "en"
+
+    def _split_by_headers(self, markdown: str, language: Language) -> list[SplitSection]:
         """当存在明确标题时，优先按标题结构切分。"""
         documents = self._header_splitter.split_text(markdown)
         sections: list[SplitSection] = []
@@ -153,12 +157,13 @@ class MarkdownStructureSplitter(BaseModel):
                 "header_path": header_path,
                 "heading_level": len(header_path) or None,
                 "split_route": "标题结构切分",
+                "language": language,
             }
-            sections.extend(self._split_section_content(content, metadata))
+            sections.extend(self._split_section_content(content, metadata, language))
 
         return sections
 
-    def _split_by_semantic(self, markdown: str) -> list[SplitSection]:
+    def _split_by_semantic(self, markdown: str, language: Language) -> list[SplitSection]:
         """当不存在明确标题时，退回到 embedding 语义切分。"""
         text = self._normalize_plain_text(markdown)
         if not text:
@@ -166,17 +171,29 @@ class MarkdownStructureSplitter(BaseModel):
 
         pieces = [
             self._sanitize_text(piece, keep_newlines=True)
-            for piece in self._get_semantic_splitter().split_text(text)
+            for piece in self._get_semantic_splitter(language).split_text(text)
             if self._sanitize_text(piece, keep_newlines=True)
         ]
+        if not pieces:
+            pieces = [text]
 
         sections: list[SplitSection] = []
-        metadata = {"header_path": [], "heading_level": None, "split_route": "语义切分"}
+        metadata = {
+            "header_path": [],
+            "heading_level": None,
+            "split_route": "语义切分",
+            "language": language,
+        }
         for content in pieces:
-            sections.extend(self._split_section_content(content, metadata))
+            sections.extend(self._split_section_content(content, metadata, language))
         return sections
 
-    def _split_section_content(self, content: str, metadata: dict[str, Any]) -> list[SplitSection]:
+    def _split_section_content(
+        self,
+        content: str,
+        metadata: dict[str, Any],
+        language: Language,
+    ) -> list[SplitSection]:
         """对单个一级块应用长度兜底切分。"""
         content = self._sanitize_text(content, keep_newlines=True)
         if not content:
@@ -185,7 +202,7 @@ class MarkdownStructureSplitter(BaseModel):
         if self._token_counter.count(content) <= self.config.parent_max_tokens:
             return [SplitSection(content=content, metadata=dict(metadata))]
 
-        pieces = self._split_by_length(content, self._parent_splitter)
+        pieces = self._split_by_length(content, self._get_parent_splitter(language))
         if len(pieces) <= 1:
             return [SplitSection(content=content, metadata=dict(metadata))]
 
@@ -231,7 +248,8 @@ class MarkdownStructureSplitter(BaseModel):
         child_blocks: list[ChildBlock] = []
 
         for parent in parent_chunks:
-            pieces = self._split_by_length(parent.content, self._child_splitter)
+            language = self._ensure_language(parent.metadata.get("language"))
+            pieces = self._split_by_length(parent.content, self._get_child_splitter(language))
             if not pieces:
                 pieces = [parent.content]
 
@@ -266,20 +284,20 @@ class MarkdownStructureSplitter(BaseModel):
             strip_headers=False,
         )
 
-    def _get_semantic_splitter(self) -> SemanticChunker:
-        """按需初始化并返回语义切分器。"""
-        if self._semantic_splitter is None:
-            self._semantic_splitter = self._build_semantic_splitter()
-        return self._semantic_splitter
+    def _get_semantic_splitter(self, language: Language) -> SemanticChunker:
+        """按语言懒加载语义切分器。"""
+        if language not in self._semantic_splitters:
+            self._semantic_splitters[language] = self._build_semantic_splitter(language)
+        return self._semantic_splitters[language]
 
-    def _build_semantic_splitter(self) -> SemanticChunker:
-        """构造基于 embedding 的语义切分器。"""
+    def _build_semantic_splitter(self, language: Language) -> SemanticChunker:
+        """构造指定语言的语义切分器。"""
         return SemanticChunker(
             embeddings=self._get_embedding_model(),
             buffer_size=self.config.semantic_buffer_size,
             breakpoint_threshold_type=self.config.semantic_breakpoint_threshold_type,
             breakpoint_threshold_amount=self.config.semantic_breakpoint_threshold_amount,
-            sentence_split_regex=self.config.semantic_sentence_split_regex,
+            sentence_split_regex=self._get_sentence_split_regex(language),
         )
 
     def _get_embedding_model(self) -> Any:
@@ -288,23 +306,88 @@ class MarkdownStructureSplitter(BaseModel):
             self._embedding_model = build_embedding_model()
         return self._embedding_model
 
-    def _build_length_splitter(self, chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSplitter:
-        """构造统一的长度兜底切分器。"""
-        separators = ["\n\n", "\n", "。", "！", "？", ". ", "! ", "? ", "；", ";", "，", ",", " ", ""]
+    def _get_parent_splitter(self, language: Language) -> RecursiveCharacterTextSplitter:
+        """按语言懒加载父块长度兜底切分器。"""
+        if language not in self._parent_splitters:
+            self._parent_splitters[language] = self._build_length_splitter(
+                chunk_size=self.config.parent_max_tokens,
+                chunk_overlap=self.config.parent_chunk_overlap,
+                language=language,
+            )
+        return self._parent_splitters[language]
 
-        try:
-            return RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-                encoding_name=self.config.tokenizer_encoding,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                separators=separators,
+    def _get_child_splitter(self, language: Language) -> RecursiveCharacterTextSplitter:
+        """按语言懒加载子块长度兜底切分器。"""
+        if language not in self._child_splitters:
+            self._child_splitters[language] = self._build_length_splitter(
+                chunk_size=self.config.child_max_tokens,
+                chunk_overlap=self.config.child_chunk_overlap,
+                language=language,
             )
-        except Exception:
-            return RecursiveCharacterTextSplitter(
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                separators=separators,
-            )
+        return self._child_splitters[language]
+
+    def _build_length_splitter(
+        self,
+        chunk_size: int,
+        chunk_overlap: int,
+        language: Language,
+    ) -> RecursiveCharacterTextSplitter:
+        """构造指定语言的长度兜底切分器。"""
+        separators = self._get_length_separators(language)
+        return RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            encoding_name=self.config.tokenizer_encoding,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=separators,
+        )
+
+    def _get_sentence_split_regex(self, language: Language) -> str:
+        """返回指定语言的语义切分句子边界规则。"""
+        if language == "zh":
+            return self.config.zh_semantic_sentence_split_regex
+        return self.config.en_semantic_sentence_split_regex
+
+    def _get_length_separators(self, language: Language) -> list[str]:
+        """返回指定语言优先使用的长度切分边界。"""
+        if language == "zh":
+            return [
+                "\n\n",
+                "\n",
+                "。",
+                "！",
+                "？",
+                "；",
+                "：",
+                "，",
+                "、",
+                ". ",
+                "! ",
+                "? ",
+                "; ",
+                ": ",
+                ", ",
+                " ",
+                "",
+            ]
+        return [
+            "\n\n",
+            "\n",
+            ". ",
+            "! ",
+            "? ",
+            "; ",
+            ": ",
+            ", ",
+            "。",
+            "！",
+            "？",
+            "；",
+            "：",
+            "，",
+            "、",
+            " ",
+            "",
+        ]
 
     def _extract_header_path(self, metadata: dict[str, Any]) -> list[str]:
         """从标题切分器的 metadata 中提取标题路径。"""
@@ -346,6 +429,9 @@ class MarkdownStructureSplitter(BaseModel):
         text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
         return text.strip()
 
+    def _ensure_language(self, value: Any) -> Language:
+        """把 metadata 中的语言值规范化为受支持的语言。"""
+        return "zh" if value == "zh" else "en"
 
 __all__ = [
     "ChunkingResult",
