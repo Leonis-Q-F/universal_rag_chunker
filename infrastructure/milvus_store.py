@@ -98,7 +98,7 @@ class MilvusStore:
         self.ensure_collections(index)
         grouped_records: dict[str, list[dict[str, Any]]] = {}
         for record in records:
-            collection_name = self._collection_name(index=index, language=record.language)
+            collection_name = index.zh_collection_name if record.language == "zh" else index.en_collection_name
             grouped_records.setdefault(collection_name, []).append(
                 {
                     "entry_id": str(record.entry_id),
@@ -374,10 +374,6 @@ class MilvusStore:
             if metadata.get(key) != value:
                 return False
         return True
-
-    def _collection_name(self, index: RetrievalIndex, language: str) -> str:
-        """根据语言获取 collection 名。"""
-        return index.zh_collection_name if language == "zh" else index.en_collection_name
 
     def _analyzer_params(self, language: str) -> dict[str, Any]:
         """为不同语言返回 analyzer 配置。"""

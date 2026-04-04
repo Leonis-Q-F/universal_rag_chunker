@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from uuid import UUID
 
 from ..domain.constants import DEFAULT_CHUNK_VERSION, DEFAULT_SPARSE_PROVIDER, IndexStatus, RetrievalTextPolicy
@@ -101,8 +100,8 @@ class IndexService:
             status=IndexStatus.BUILDING.value,
             is_active=False,
         )
-        index.zh_collection_name = self._build_collection_name(index.index_id, language="zh")
-        index.en_collection_name = self._build_collection_name(index.index_id, language="en")
+        index.zh_collection_name = f"rag_idx_{index.index_id.hex}_zh"
+        index.en_collection_name = f"rag_idx_{index.index_id.hex}_en"
         return self._document_store.create_index(index)
 
     def _is_compatible(self, index: RetrievalIndex) -> bool:
@@ -127,6 +126,11 @@ class IndexService:
             file_name = str(block.metadata.get("file_name", "unknown"))
             file_type = str(block.metadata.get("file_type", "txt"))
             retrieval_text = self._build_retrieval_text(block=block, retrieval_text_policy=retrieval_text_policy)
+            vector_collection = (
+                (index.zh_collection_name or f"rag_idx_{index.index_id.hex}_zh")
+                if block.language == "zh"
+                else (index.en_collection_name or f"rag_idx_{index.index_id.hex}_en")
+            )
             entries.append(
                 IndexEntry(
                     index_id=index.index_id,
@@ -141,7 +145,7 @@ class IndexService:
                     file_name=file_name,
                     language=block.language,
                     retrieval_text=retrieval_text,
-                    vector_collection=self._collection_name(index=index, language=block.language),
+                    vector_collection=vector_collection,
                     vector_primary_key="",
                     metadata=dict(block.metadata),
                     is_active=True,
@@ -158,11 +162,9 @@ class IndexService:
         file_name = str(block.metadata.get("file_name", "unknown"))
         file_type = str(block.metadata.get("file_type", "txt"))
         header_path = block.metadata.get("header_path") or []
-        block_kind = self._classify_block_kind(block=block)
         parts = [
             f"文件名: {file_name}",
             f"文件类型: {file_type}",
-            f"块类型: {block_kind}",
         ]
         if header_path:
             parts.append(f"标题路径: {' > '.join(header_path)}")
@@ -203,37 +205,3 @@ class IndexService:
             for entry, vector in zip(entries, vectors, strict=True)
         ]
         self._vector_store.upsert_entries(index=index, records=records)
-
-    def _collection_name(self, index: RetrievalIndex, language: str) -> str:
-        """按语言返回当前索引对应的 collection 名。"""
-        if language == "zh":
-            return index.zh_collection_name or self._build_collection_name(index.index_id, language="zh")
-        return index.en_collection_name or self._build_collection_name(index.index_id, language="en")
-
-    def _build_collection_name(self, index_id: UUID, language: str) -> str:
-        """按统一命名规则生成 Milvus collection 名。"""
-        return f"rag_idx_{index_id.hex}_{language}"
-
-    def _classify_block_kind(self, block) -> str:
-        """为 retrieval_text 估计块的语义角色。"""
-        header_path = [str(item) for item in block.metadata.get("header_path") or []]
-        header_text = " ".join(header_path)
-        content = block.content.strip()
-        has_code = "```" in content
-        has_definition_signature = bool(
-            re.search(r"(?m)^\s*(class|def)\s+\w+|^\s*@dataclass\b|^\s*Attributes:\s*$", content)
-        )
-
-        if "核心收获" in header_text or "总结" in header_text:
-            return "总结块"
-        if "流程" in header_text or "详解" in header_text or re.search(r"(?m)^\s*\d+\.\s", content):
-            return "流程说明块"
-        if "示例" in header_text:
-            return "代码示例块" if has_code else "示例块"
-        if has_code and has_definition_signature:
-            return "代码定义块"
-        if any(keyword in header_text for keyword in ["什么是", "设计理念", "配置管理", "核心数据结构", "作用"]):
-            return "定义说明块"
-        if has_code:
-            return "代码示例块"
-        return "正文块"

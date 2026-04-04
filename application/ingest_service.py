@@ -6,7 +6,7 @@ from ..domain.constants import DEFAULT_CHUNK_VERSION
 from ..domain.entities import SourceDocument
 from ..domain.ports import ChunkerPort, DocumentStorePort, LoaderPort
 from ..domain.value_objects import ParsedDocument, sha256_text
-from .dto import IndexedDocument, IngestDocumentsRequest, IngestFilesRequest, IngestResult, InputDocument
+from .dto import IndexedDocument, IngestDocumentsRequest, IngestFilesRequest, IngestResult
 from .index_service import IndexService
 from .namespace_resolver import NamespaceResolver
 
@@ -44,7 +44,19 @@ class IngestService:
     def ingest_documents(self, request: IngestDocumentsRequest) -> IngestResult:
         """接收宿主传入的解析结果并执行统一入库与索引。"""
         namespace = self._namespace_resolver.resolve_for_ingest(request.namespace_reference())
-        parsed_documents = [self._to_parsed_document(document) for document in request.documents]
+        parsed_documents = [
+            ParsedDocument(
+                external_doc_id=document.external_doc_id,
+                file_name=document.file_name,
+                file_type=document.file_type,
+                source_uri=document.source_uri,
+                parsed_md_content=document.parsed_md_content,
+                metadata=dict(document.metadata),
+                parser_name=document.parser_name,
+                parser_version=document.parser_version,
+            )
+            for document in request.documents
+        ]
         return self._ingest_parsed_documents(
             namespace_id=namespace.namespace_id,
             namespace_key=namespace.namespace_key,
@@ -58,7 +70,6 @@ class IngestService:
         parsed_documents: list[ParsedDocument],
     ) -> IngestResult:
         """把解析后的文档写入存储、切分并同步到可检索索引。"""
-        # 转换为内部文档aqs1   swa
         source_documents = [
             SourceDocument(
                 namespace_id=namespace_id,
@@ -103,17 +114,4 @@ class IngestService:
             chunk_version=self._chunk_version,
             index_id=active_index.index_id,
             index_version=active_index.index_version,
-        )
-
-    def _to_parsed_document(self, document: InputDocument) -> ParsedDocument:
-        """把应用层输入文档转换为内部 ParsedDocument。"""
-        return ParsedDocument(
-            external_doc_id=document.external_doc_id,
-            file_name=document.file_name,
-            file_type=document.file_type,
-            source_uri=document.source_uri,
-            parsed_md_content=document.parsed_md_content,
-            metadata=dict(document.metadata),
-            parser_name=document.parser_name,
-            parser_version=document.parser_version,
         )

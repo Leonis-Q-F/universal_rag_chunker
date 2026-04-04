@@ -18,10 +18,16 @@ class NamespaceResolver:
         if reference.namespace_id is not None:
             namespace = self._document_store.get_namespace(namespace_id=reference.namespace_id)
             self._ensure_namespace_match(namespace, reference)
-            return self._to_resolved_namespace(namespace)
+            return ResolvedNamespace(
+                namespace_id=namespace.namespace_id,
+                namespace_key=namespace.namespace_key,
+            )
 
         namespace = self._document_store.ensure_namespace(namespace_key=reference.namespace_key or "")
-        return self._to_resolved_namespace(namespace)
+        return ResolvedNamespace(
+            namespace_id=namespace.namespace_id,
+            namespace_key=namespace.namespace_key,
+        )
 
     def resolve_existing(self, reference: NamespaceReference) -> ResolvedNamespace:
         """查询与索引路径只允许解析既有 namespace。"""
@@ -30,7 +36,10 @@ class NamespaceResolver:
             namespace_key=reference.namespace_key,
         )
         self._ensure_namespace_match(namespace, reference)
-        return self._to_resolved_namespace(namespace)
+        return ResolvedNamespace(
+            namespace_id=namespace.namespace_id,
+            namespace_key=namespace.namespace_key,
+        )
 
     def _ensure_namespace_match(self, namespace: Namespace, reference: NamespaceReference) -> None:
         """当请求同时携带 id 与 key 时，校验它们指向同一个 namespace。"""
@@ -38,10 +47,3 @@ class NamespaceResolver:
             return
         if namespace.namespace_key != reference.namespace_key:
             raise NamespaceConflictError("namespace_id 与 namespace_key 不匹配。")
-
-    def _to_resolved_namespace(self, namespace: Namespace) -> ResolvedNamespace:
-        """把领域实体收敛为应用层稳定输出。"""
-        return ResolvedNamespace(
-            namespace_id=namespace.namespace_id,
-            namespace_key=namespace.namespace_key,
-        )
